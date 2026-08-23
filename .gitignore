@@ -1,0 +1,25 @@
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Byte-compiled / optimized
+__pycache__/
+*.py[cod]
+*$py.class
+
+# IDEs
+.vscode/
+.idea/
+.DS_Store
+
+# Logs and DB
+*.log
+*.sqlite
+*.db
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

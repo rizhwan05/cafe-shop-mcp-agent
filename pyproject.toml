@@ -1,0 +1,23 @@
+[project]
+name = "cafe-shop-mcp-agent"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "boto3>=1.42.69",
+    "dotenv>=0.9.9",
+    "fastapi>=0.135.1",
+    "fastmcp>=3.1.1",
+    "langchain>=1.2.12",
+    "langchain-aws>=1.4.0",
+    "langchain-mcp-adapters>=0.2.2",
+    "langgraph>=1.1.2",
+    "langgraph-checkpoint-postgres>=3.0.4",
+    "psycopg-pool>=3.3.0",
+    "psycopg2>=2.9.11",
+    "psycopg2-binary>=2.9.11",
+    "psycopg[binary]>=3.3.3",
+    "sqlalchemy>=2.0.48",
+    "uvicorn>=0.42.0",
+]

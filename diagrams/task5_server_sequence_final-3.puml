@@ -1,0 +1,776 @@
+@startuml sequence_diagram_for_BeanBrew_Server_Task5_Updated
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 1000
+skinparam noteBackgroundColor lightyellow
+skinparam noteTextColor black
+autonumber 1.0
+
+title Bean & Brew MCP Server - Tool/Prompt/Resource Flow
+
+actor client
+participant "mcp_server/main.py\n(Entry point)" as Main
+participant "mcp_server/router/router.py\n(Router)" as Router
+participant "mcp_server/migrations/create_tables.py\n(Migrations)" as Migrations
+participant "mcp_server/tools/mcp_tools.py\n(MCP Tools)" as Tools
+participant "mcp_server/prompts/system_prompt.py\n(MCP Prompts)" as Prompts
+participant "mcp_server/resources/resources.py\n(MCP Resources)" as Resources
+participant "mcp_server/repositories/coffee_repository.py\n(CoffeeRepository)" as Repo
+participant "mcp_server/repositories/error_log_repository.py\n(ErrorLogRepository)" as LogRepo
+participant "mcp_server/repositories/database.py\n(SQLAlchemy)" as DB
+participant "mcp_server/utils/logging_utils.py\n(log_and_raise)" as LogUtils
+participant "mcp_server/utils/exceptions/custom_exceptions.py\n(AppBaseException)" as Exceptions
+participant "mcp_server/utils/exceptions/error_codes.py\n(ErrorCode)" as ErrorCodes
+participant "mcp_server/settings.py\n(Settings)" as Settings
+participant "MCP Runtime\n(FastMCP)" as McpRuntime
+participant "mcp_server/.env" as Env
+
+note over Main
+Entry point:
+- create_tables() runs database migrations and seeds menu data
+- get_mcp() registers all tools, prompts, and resources on the FastMCP instance
+- mcp.run() starts the MCP server on the configured host and port
+end note
+
+note over Main
+Imports:
+- sys, os
+- migrations.create_tables: create_tables
+- router.router: get_mcp
+- settings: settings
+end note
+
+note over Router
+Router imports the mcp instance directly from tools/mcp_tools.py
+and calls register_prompts and register_resources on it.
+Tools are registered via @mcp.tool() decorators in tools/mcp_tools.py.
+
+Imports:
+- tools.mcp_tools: mcp
+- prompts.system_prompt: register_prompts
+- resources.resources: register_resources
+end note
+
+note over Migrations
+Imports:
+- repositories.database: Base, engine, get_db
+- repositories.schema.schema: MenuItemSchema, OrderSchema, OrderItemSchema, ErrorLogSchema
+end note
+
+note over Tools
+Module-level:
+  mcp = FastMCP("bean-brew-tools-server")  — FastMCP instance lives here
+  repo = CoffeeRepository()
+
+Tools registered via @mcp.tool() decorators: check_menu, check_order_status, add_order.
+check_inventory is removed — check_menu now returns stock_quantity per item.
+
+Imports:
+- typing: Any, Dict, List
+- mcp.server.fastmcp: FastMCP
+- repositories.coffee_repository: CoffeeRepository
+- utils.exceptions.custom_exceptions: AppBaseException, MenuItemNotFoundException, OrderNotFoundException,
+  InsufficientStockException, InvalidRequestException
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+- utils.logging_utils: log_and_raise
+- settings: settings
+end note
+
+note over Prompts
+Imports:
+- mcp.server.fastmcp: FastMCP
+end note
+
+note over Resources
+Module-level instantiation on import:
+  repo = CoffeeRepository()
+
+Imports:
+- mcp.server.fastmcp: FastMCP
+- repositories.coffee_repository: CoffeeRepository
+- utils.exceptions.custom_exceptions: AppBaseException
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+- utils.logging_utils: log_and_raise
+end note
+
+note over Repo
+Imports:
+- typing: List, Optional
+- repositories.database: get_db
+- repositories.schema.schema: MenuItemSchema, OrderSchema, OrderItemSchema
+- utils.exceptions.custom_exceptions: DatabaseConnectionException
+end note
+
+note over LogRepo
+Imports:
+- typing: Optional
+- repositories.database: get_db
+- repositories.schema.schema: ErrorLogSchema
+- utils.exceptions.custom_exceptions: DatabaseConnectionException
+end note
+
+note over DB
+Module-level singleton pattern:
+  db = get_database()  ← @lru_cache singleton Database instance
+  engine = db.engine
+  SessionLocal = db.SessionLocal
+  Base = declarative_base()
+
+Database.__init__ reads settings.db_username, settings.db_password,
+settings.db_host, settings.db_port, settings.db_name
+to build the SQLAlchemy connection string.
+This happens once at module import via the @lru_cache singleton.
+
+get_db() is a @contextmanager that opens a SessionLocal session,
+yields it, and closes it in the finally block.
+
+create_tables() calls Base.metadata.create_all(bind=engine) then seed_data().
+
+Imports:
+- sqlalchemy: create_engine
+- sqlalchemy.orm: sessionmaker, declarative_base
+- contextlib: contextmanager
+- functools: lru_cache
+- settings: settings
+end note
+
+note over LogUtils
+log_and_raise(exc, source, details=None):
+  1. Creates ErrorLogRepository instance
+  2. Calls repo.create_error_log() — swallows any logging failure silently
+  3. Raises exc unconditionally
+
+Imports:
+- typing: Optional
+- repositories.error_log_repository: ErrorLogRepository
+- utils.exceptions.custom_exceptions: AppBaseException
+end note
+
+note over Exceptions
+AppBaseException.__init__(error_code, message, status_code):
+  Sets self.error_code, self.message, self.status_code
+  Calls super().__init__(self.message)
+
+DatabaseConnectionException.__init__(detail):
+  Calls ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001") → "BB_DB_001"
+  Calls super().__init__(error_code="BB_DB_001", message=detail, status_code=settings.http_service_unavailable)
+
+MenuItemNotFoundException.__init__(item_name):
+  Calls ErrorCodeStatus.get(ErrorCode.MENU_ITEM_NOT_FOUND, "BB_MENU_001") → "BB_MENU_001"
+  Calls super().__init__(error_code="BB_MENU_001", message="Menu item '{item_name}' not found.", status_code=settings.http_not_found)
+
+OrderNotFoundException.__init__(order_id):
+  Calls ErrorCodeStatus.get(ErrorCode.ORDER_NOT_FOUND, "BB_ORD_001") → "BB_ORD_001"
+  Calls super().__init__(error_code="BB_ORD_001", message="Order '{order_id}' not found.", status_code=settings.http_not_found)
+
+InsufficientStockException.__init__(item_name, available):
+  Calls ErrorCodeStatus.get(ErrorCode.INSUFFICIENT_STOCK, "BB_ORD_002") → "BB_ORD_002"
+  Calls super().__init__(error_code="BB_ORD_002", message="Insufficient stock for '{item_name}'. Available: {available}.", status_code=settings.http_bad_request)
+
+InvalidRequestException.__init__(detail):
+  Calls ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001") → "BB_REQ_001"
+  Calls super().__init__(error_code="BB_REQ_001", message=detail, status_code=settings.http_bad_request)
+
+Imports:
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+end note
+
+note over Settings
+HTTP status codes stored in settings (used everywhere instead of hardcoded numbers):
+  http_ok = 200, http_created = 201, http_bad_request = 400
+  http_not_found = 404, http_internal_server_error = 500, http_service_unavailable = 503
+
+Imports:
+- dotenv: load_dotenv
+- os
+end note
+
+note over Env
+mcp_server/.env keys used:
+DB_HOST, DB_PORT, DB_NAME, DB_USERNAME, DB_PASSWORD,
+MCP_HOST, MCP_PORT
+end note
+
+activate Main
+
+group APPLICATION Startup
+
+  Main -> Main : Calling sys.path.insert() to add the current directory to the Python path\nso all local module imports work correctly.
+
+  group Main Try Block (startup)
+
+    Main -> Settings : Reading settings.db_host, settings.db_port, settings.db_name,\nsettings.db_username, and settings.db_password\nto build the SQLAlchemy connection string in Database.__init__().\nThis happens when repositories/database.py is first imported.
+    Settings -> Env : Reading DB_HOST, DB_PORT, DB_NAME, DB_USERNAME, DB_PASSWORD\nfrom .env via os.getenv().
+    Env --> Settings : Returns the five DB credential strings.
+    Settings --> Main : Returns db_host, db_port, db_name, db_username, db_password.
+
+    Main -> Main : Calling create_tables() from migrations/create_tables.py\nto create all database tables and seed the menu data before the server starts.
+    activate Migrations
+
+    group Migrations Block: create_tables()
+
+      Migrations -> DB : Calling Base.metadata.create_all(bind=engine)\nto create all schema tables in the database if they do not exist yet.
+
+      Migrations -> Migrations : Calling seed_data() to check if the menu table has data\nand insert default menu items if it is empty.
+
+      group Migrations Block: seed_data()
+
+        Migrations -> DB : Calling get_db() to open a database session for the seed check.
+        activate DB
+        DB --> Migrations : Yields the SQLAlchemy session.
+
+        Migrations -> DB : Calling session.query(MenuItemSchema).first()\nto see if any menu items already exist.
+        DB --> Migrations : Returns the first MenuItemSchema row or None.
+
+        alt menu items already exist
+          Migrations -> Migrations : Returning early because the table already has data.
+        else no data found
+          Migrations -> DB : Calling session.add_all(menu_items) and session.commit()\nto insert the default menu rows into the database.
+        end
+        deactivate DB
+
+      end
+    end
+    Migrations --> Main : create_tables() returns — tables and seed data are ready.
+    deactivate Migrations
+
+    group Router Layer
+
+      Main -> Router : Calling get_mcp() in mcp_server/router/router.py\nto get the FastMCP instance imported from tools/mcp_tools.py.
+      activate Router
+
+      group Router Function: get_mcp()
+
+        Router -> Router : mcp was created in tools/mcp_tools.py at module level.\nTools (check_menu, check_order_status, add_order) are registered\nvia @mcp.tool() decorators directly above each function.\ncheck_inventory is removed — check_menu now includes stock_quantity.
+
+        note over Router, Tools
+        Tools are registered at module level in tools/mcp_tools.py using @mcp.tool() decorators.
+        No register_tools() function exists — decorators handle registration at import time.
+        end note
+
+        group Router Try Block (register_prompts)
+          Router -> Prompts : Calling register_prompts(_mcp) in mcp_server/prompts/system_prompt.py\nto register all prompt functions on the FastMCP instance.
+          activate Prompts
+
+          group Prompts Function: register_prompts(mcp)
+            Prompts -> McpRuntime : Calling mcp.prompt() decorator on brew_buddy_system\nto make it fetchable as an MCP prompt.
+            McpRuntime --> Prompts : brew_buddy_system registered as MCP prompt.
+            Prompts -> McpRuntime : Calling mcp.prompt() decorator on order_confirmation\nto make it fetchable as an MCP prompt.
+            McpRuntime --> Prompts : order_confirmation registered as MCP prompt.
+          end
+          Prompts --> Router : register_prompts() returns — all prompts are registered.
+          deactivate Prompts
+        end
+        group Router Except Block (register_prompts)
+          Router -> Router : Raising RuntimeError("Failed to register MCP prompts: ...")\nso startup fails clearly instead of running with no prompts available.
+          Router --> Main : RuntimeError propagates to the main startup except block.
+        end
+
+        group Router Try Block (register_resources)
+          Router -> Resources : Calling register_resources(_mcp) in mcp_server/resources/resources.py\nto register all resource handlers on the FastMCP instance.
+          activate Resources
+
+          group Resources Function: register_resources(mcp)
+            Resources -> McpRuntime : Calling mcp.resource("menu://items") decorator on get_menu_resource\nto register it as a fetchable MCP resource at the menu://items URI.
+            McpRuntime --> Resources : get_menu_resource registered as MCP resource.
+            Resources -> McpRuntime : Calling mcp.resource("store://info") decorator on get_store_info\nto register it as a fetchable MCP resource at the store://info URI.
+            McpRuntime --> Resources : get_store_info registered as MCP resource.
+          end
+          Resources --> Router : register_resources() returns — all resources are registered.
+          deactivate Resources
+        end
+        group Router Except Block (register_resources)
+          Router -> Router : Raising RuntimeError("Failed to register MCP resources: ...")\nso startup fails clearly instead of running with no resources available.
+          Router --> Main : RuntimeError propagates to the main startup except block.
+        end
+
+        Router --> Main : Returns the fully configured FastMCP instance (_mcp).
+      end
+      deactivate Router
+    end
+
+    Main -> Settings : Reading settings.mcp_host and settings.mcp_port\nto get the host and port for the MCP server.
+    Settings -> Env : Reading MCP_HOST and MCP_PORT from .env via os.getenv().
+    Env --> Settings : Returns MCP_HOST and MCP_PORT strings.
+    Settings --> Main : Returns mcp_host string and mcp_port int.
+
+    Main -> McpRuntime : Calling mcp.run() with transport="streamable-http"\nto start the MCP server and begin accepting client connections on the configured host and port.
+
+  end
+  group Main Except Block (startup)
+    Main -> Main : Raising RuntimeError("MCP server startup failed: ...")\nso any startup error is clearly reported and the process stops.
+  end
+
+end group
+
+' ---------------- TOOL INVOCATIONS ----------------
+
+group Service Layer: MCP Tools
+
+  client -> McpRuntime : Client sends a tool call for check_menu with no arguments.
+  McpRuntime -> Tools : FastMCP dispatches the call to check_menu().
+  activate Tools
+
+  group Tools Function: check_menu()
+    note right of Tools
+    check_menu:
+    Fetches all active menu items from Bean & Brew, including stock availability.
+    Use this whenever the customer asks about drinks, prices, recommendations,
+    or whether a specific item is available or in stock.
+    Arguments: None.
+    Returns: {items: [{name, description, price, in_stock, stock_quantity}]}
+    end note
+
+    group Tools Try Block (check_menu)
+
+      Tools -> Repo : Calling repo.get_menu_items(active_only=True) in coffee_repository.py\nto fetch all active menu item rows from the database.
+      activate Repo
+
+      group Repo Block: get_menu_items(active_only=True)
+        group Repo Try Block
+          Repo -> DB : Calling get_db() to open a session using the context manager.
+          activate DB
+          DB --> Repo : Yields the SQLAlchemy session.
+          Repo -> DB : ORM: session.query(MenuItemSchema)\n.filter(MenuItemSchema.is_active.is_(True))\n.order_by(MenuItemSchema.name.asc()).all()
+          DB --> Repo : Returns the list of active MenuItemSchema rows.
+          Repo -> Repo : Calling session.expunge(item) for each item to detach from the session.
+          deactivate DB
+          Repo --> Tools : Returns List[MenuItemSchema].
+        end
+        group Repo Except Block
+          Repo -> Exceptions : Calling DatabaseConnectionException("Failed to fetch menu items: ...").
+          Repo -> Repo : Re-raising to propagate up to the tool.
+        end
+      end
+      deactivate Repo
+
+      Tools -> Tools : Building result dict with name, description, price, in_stock,\nand stock_quantity for each item and returning it to the MCP runtime.
+      Tools --> McpRuntime : Returns the {items: [...]} dict.
+      McpRuntime --> client : Returns a success response with the menu data.
+    end
+
+    group Tools Except Block (check_menu)
+      Tools -> LogUtils : Calling log_and_raise(exc, source="tools.check_menu")\nto write the error to error_logs and re-raise.
+      LogUtils -> LogRepo : Creating ErrorLogRepository() and calling repo.create_error_log().
+      activate LogRepo
+      group LogRepo Block: create_error_log(...)
+        group LogRepo Try Block
+          LogRepo -> DB : Calling get_db() to open a session and inserting the ErrorLogSchema record.
+          activate DB
+          DB --> LogRepo : Yields the session.
+          LogRepo -> LogRepo : Creating ErrorLogSchema, session.add(), session.commit(),\nsession.refresh(), session.expunge().
+          DB --> LogRepo : Returns after commit.
+          deactivate DB
+          LogRepo --> LogUtils : Returns the ErrorLogSchema record.
+        end
+        group LogRepo Except Block
+          LogRepo -> Exceptions : Calling DatabaseConnectionException("Failed to log error: ...").
+          LogRepo --> LogUtils : DatabaseConnectionException swallowed silently by log_and_raise.
+        end
+      end
+      deactivate LogRepo
+      LogUtils -> LogUtils : Raising exc unconditionally.
+      LogUtils --> Tools : Re-raises the AppBaseException to the tool.
+      Tools --> McpRuntime : AppBaseException propagates to the MCP runtime.
+      McpRuntime --> client : Returns an error response with the relevant error code.
+    end
+  end
+  deactivate Tools
+
+    client -> McpRuntime : Client sends a tool call for check_order_status with order_sequence_id as the argument.
+  McpRuntime -> Tools : FastMCP dispatches the call to check_order_status(order_sequence_id).
+  activate Tools
+
+  group Tools Function: check_order_status(order_sequence_id)
+    note right of Tools
+    check_order_status:
+    Looks up the current status of an order using the sequence ID.
+    Always use the integer order_sequence_id, not the UUID order_id.
+    Arguments: order_sequence_id (int).
+    Returns: {order_sequence_id, order_id, status}
+    end note
+
+    group Tools Try Block (check_order_status)
+
+      Tools -> Repo : Calling repo.get_order_by_sequence_id(order_sequence_id) in coffee_repository.py\nto fetch the order row by its sequence ID.
+      activate Repo
+
+      group Repo Block: get_order_by_sequence_id(order_sequence_id)
+        group Repo Try Block
+          Repo -> DB : Calling get_db() to open a session.
+          activate DB
+          DB --> Repo : Yields the SQLAlchemy session.
+          Repo -> DB : ORM: session.query(OrderSchema)\n.filter(OrderSchema.order_sequence_id == order_sequence_id).first()
+          DB --> Repo : Returns the OrderSchema row or None.
+          Repo -> Repo : If order found, calling session.expunge(order) to detach it from the session.
+          deactivate DB
+          Repo --> Tools : Returns the OrderSchema object or None.
+        end
+        group Repo Except Block
+          Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to fetch order: ...").
+          activate Exceptions
+          Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+          ErrorCodes --> Exceptions : Returns "BB_DB_001".
+          Exceptions -> Exceptions : Setting self.error_code="BB_DB_001", self.message, self.status_code=settings.http_service_unavailable.\nCalling super().__init__().
+          Exceptions --> Repo : DatabaseConnectionException raised.
+          deactivate Exceptions
+          Repo --> Tools : DatabaseConnectionException propagates to check_order_status.
+        end
+      end
+      deactivate Repo
+
+      alt order not found
+        Tools -> Exceptions : Calling OrderNotFoundException.__init__(str(order_sequence_id)).
+        activate Exceptions
+        Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.ORDER_NOT_FOUND, "BB_ORD_001").
+        ErrorCodes --> Exceptions : Returns "BB_ORD_001".
+        Exceptions -> Exceptions : Setting self.error_code="BB_ORD_001",\nself.message="Order '{order_id}' not found.", self.status_code=settings.http_not_found.\nCalling super().__init__().
+        Exceptions --> Tools : OrderNotFoundException raised.
+        deactivate Exceptions
+        Tools -> LogUtils : Calling log_and_raise(exc, source="tools.check_order_status")\nto log and re-raise the error.
+        activate LogUtils
+        group LogUtils Block: log_and_raise(exc, source, details=None)
+          LogUtils -> LogRepo : Creating ErrorLogRepository() and calling repo.create_error_log().
+          activate LogRepo
+          LogRepo -> LogRepo : create_error_log(): opens session, inserts ErrorLogSchema, commits. — refer to 1.55 to 1.62 sequence number.
+          deactivate LogRepo
+          LogUtils -> LogUtils : Raising exc unconditionally.
+          LogUtils --> Tools : Re-raises the OrderNotFoundException.
+        end
+        deactivate LogUtils
+      else order found
+        Tools -> Tools : Building {order_sequence_id: order.order_sequence_id, order_id: str(order.order_id), status: order.status}\nand returning it as the tool result dict.
+        Tools --> McpRuntime : Returns the order status result dict.
+        McpRuntime --> client : Returns a success response with the order status data.
+      end
+
+    end
+    group Tools Except Block (check_order_status)
+      Tools -> LogUtils : Calling log_and_raise() with the exception and source="tools.check_order_status".
+      activate LogUtils
+      LogUtils -> LogUtils : log_and_raise: logs to DB then re-raises exc. — refer to 1.54 to 1.64 sequence number.
+      deactivate LogUtils
+      Tools --> McpRuntime : AppBaseException propagates to the MCP runtime.
+      McpRuntime --> client : Returns an error response with the relevant error code.
+    end
+  end
+  deactivate Tools
+
+  client -> McpRuntime : Client sends a tool call for add_order with customer_name and items list as arguments.
+  McpRuntime -> Tools : FastMCP dispatches the call to add_order(customer_name, items).
+  activate Tools
+
+  group Tools Function: add_order(customer_name, items)
+    note right of Tools
+    add_order:
+    Places a new order and reduces stock for each item automatically.
+    Only call this if all items exist in the menu from the resource context.
+    Never call this for items not on the menu — inform the user instead.
+    Arguments: customer_name (str), items (List[{item_name, quantity}]).
+    Returns: {order_id, order_sequence_id, status}
+
+    Note: On the client side, HumanInTheLoopMiddleware intercepts this tool call
+    before it reaches the MCP server. The call only arrives here after a human
+    has approved it. The MCP server executes add_order identically regardless.
+    end note
+
+    group Tools Try Block (add_order)
+
+      Tools -> Tools : Checking if the items list is empty\nand raising InvalidRequestException if so because an order needs at least one item.
+
+      alt items list is empty
+        Tools -> Exceptions : Calling InvalidRequestException.__init__("Order items cannot be empty.").
+        activate Exceptions
+        Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001").
+        ErrorCodes --> Exceptions : Returns "BB_REQ_001".
+        Exceptions -> Exceptions : Setting self.error_code="BB_REQ_001",\nself.message="Order items cannot be empty.", self.status_code=settings.http_bad_request.\nCalling super().__init__().
+        Exceptions --> Tools : InvalidRequestException raised.
+        deactivate Exceptions
+        Tools -> LogUtils : Calling log_and_raise(exc, source="tools.add_order")\nto log and re-raise the error.
+        activate LogUtils
+        LogUtils -> LogUtils : log_and_raise: logs to DB then re-raises exc. — refer to 1.54 to 1.66 sequence number.
+        deactivate LogUtils
+      else items list has entries
+
+        loop for each item in items
+
+          Tools -> Tools : Checking that item_name is a non-empty string and quantity is an int > 0.\nRaising InvalidRequestException if either check fails.
+
+          Tools -> Repo : Calling repo.get_menu_item_by_name(item_name) in coffee_repository.py\nto check the item exists and get its ID and current stock.
+          activate Repo
+          group Repo Block: get_menu_item_by_name(item_name)
+            group Repo Try Block
+              Repo -> DB : Calling get_db() to open a session.
+              activate DB
+              DB --> Repo : Yields the SQLAlchemy session.
+              Repo -> DB : ORM: session.query(MenuItemSchema).filter(MenuItemSchema.name.ilike(item_name)).first().
+              DB --> Repo : Returns the MenuItemSchema row or None.
+              Repo -> Repo : If item found, calling session.expunge(item).
+              deactivate DB
+              Repo --> Tools : Returns the MenuItemSchema object or None.
+            end
+            group Repo Except Block
+              Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to fetch menu item: ...").
+              activate Exceptions
+              Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+              ErrorCodes --> Exceptions : Returns "BB_DB_001".
+              Exceptions -> Exceptions : Sets self.error_code, message, status_code=settings.http_service_unavailable. Calls super().__init__().
+              Exceptions --> Repo : DatabaseConnectionException raised.
+              deactivate Exceptions
+              Repo --> Tools : DatabaseConnectionException propagates to add_order.
+            end
+          end
+          deactivate Repo
+
+          alt item not found in menu
+            Tools -> Exceptions : Calling MenuItemNotFoundException.__init__(item_name).
+            activate Exceptions
+            Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.MENU_ITEM_NOT_FOUND, "BB_MENU_001").
+            ErrorCodes --> Exceptions : Returns "BB_MENU_001".
+            Exceptions -> Exceptions : Sets self.error_code="BB_MENU_001", self.message, self.status_code=settings.http_not_found.\nCalling super().__init__().
+            Exceptions --> Tools : MenuItemNotFoundException raised.
+            deactivate Exceptions
+            Tools -> LogUtils : Calling log_and_raise(exc, source="tools.add_order").
+            LogUtils -> LogUtils :  refer to step 1.54 to 1.66 sequence number for creating error logs in table.
+          else stock is not enough
+            Tools -> Exceptions : Calling InsufficientStockException.__init__(item_name, menu_item.stock_quantity)\nbecause the available stock is less than the requested quantity.
+            activate Exceptions
+            Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.INSUFFICIENT_STOCK, "BB_ORD_002").
+            ErrorCodes --> Exceptions : Returns "BB_ORD_002".
+            Exceptions -> Exceptions : Sets self.error_code="BB_ORD_002",\nself.message="Insufficient stock for '{item_name}'. Available: {available}.", self.status_code=settings.http_bad_request.\nCalling super().__init__().
+            Exceptions --> Tools : InsufficientStockException raised.
+            deactivate Exceptions
+            Tools -> LogUtils : Calling log_and_raise(exc, source="tools.add_order").
+            LogUtils -> LogUtils :  refer to step 1.54 to 1.66 sequence number for creating error logs in table.
+          else item is valid and stock is enough
+            Tools -> Tools : Appending {menu_item_id: menu_item.menu_item_id, quantity: quantity} to order_items list\nto collect all validated items before creating the order.
+          end
+
+        end
+
+        Tools -> Repo : Calling repo.create_order(customer_name, status="PROCESSED") in coffee_repository.py\nto insert a new order row and get back the order_id and order_sequence_id.
+        activate Repo
+        group Repo Block: create_order(customer_name, status)
+          group Repo Try Block
+            Repo -> DB : Calling get_db() to open a session.
+            activate DB
+            DB --> Repo : Yields the SQLAlchemy session.
+            Repo -> DB: ORM: session.add(OrderSchema(...))\nsession.commit(), session.refresh(order)
+            
+            DB --> Repo : Returns after commit and refresh.
+            deactivate DB
+            Repo --> Tools : Returns the OrderSchema with order_id and order_sequence_id.
+          end
+          group Repo Except Block
+            Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to create order: ...").
+            activate Exceptions
+            Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+            ErrorCodes --> Exceptions : Returns "BB_DB_001".
+            Exceptions -> Exceptions : Sets self.error_code, message, status_code=settings.http_service_unavailable. Calls super().__init__().
+            Exceptions --> Repo : DatabaseConnectionException raised.
+            deactivate Exceptions
+            Repo --> Tools : DatabaseConnectionException propagates to add_order.
+          end
+        end
+        deactivate Repo
+
+        Tools -> Repo : Calling repo.create_order_items(order_id=str(order.order_id), items=order_items)\nto insert one OrderItemSchema row per item into the order_items table.
+        activate Repo
+        group Repo Block: create_order_items(order_id, items)
+          group Repo Try Block
+            Repo -> DB : Calling get_db() to open a session.
+            activate DB
+            DB --> Repo : Yields the SQLAlchemy session.
+            Repo -> DB : ORM: session.add(OrderItemSchema(...)) for each item,\nthen session.commit()
+            
+            DB --> Repo : Returns after commit.
+            deactivate DB
+            Repo --> Tools : create_order_items() returns — all order item rows inserted.
+          end
+          group Repo Except Block
+            Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to create order items: ...").
+            activate Exceptions
+            Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+            ErrorCodes --> Exceptions : Returns "BB_DB_001".
+            Exceptions -> Exceptions : Sets self.error_code, message, status_code=settings.http_service_unavailable. Calls super().__init__().
+            Exceptions --> Repo : DatabaseConnectionException raised.
+            deactivate Exceptions
+            Repo --> Tools : DatabaseConnectionException propagates to add_order.
+          end
+        end
+        deactivate Repo
+
+        loop for each order_item in validated order_items
+
+          Tools -> Repo : Calling repo.reduce_stock(order_item["menu_item_id"], order_item["quantity"])\nto subtract the ordered quantity from that item's stock_quantity.
+          activate Repo
+          group Repo Block: reduce_stock(menu_item_id, quantity)
+            group Repo Try Block
+              Repo -> DB : Calling get_db() to open a session.
+              activate DB
+              DB --> Repo : Yields the SQLAlchemy session.
+              Repo -> DB : ORM: session.query(MenuItemSchema)\n.filter(MenuItemSchema.menu_item_id == menu_item_id).first()
+              DB --> Repo : Returns the MenuItemSchema row.
+              Repo -> Repo : Setting item.stock_quantity = max(item.stock_quantity - quantity, 0).\nCalling session.commit() to persist the updated stock.
+              DB --> Repo : Returns after commit.
+              deactivate DB
+              Repo --> Tools : reduce_stock() returns — stock updated successfully.
+            end
+            group Repo Except Block
+              Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to update stock: ...").
+              activate Exceptions
+              Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+              ErrorCodes --> Exceptions : Returns "BB_DB_001".
+              Exceptions -> Exceptions : Sets self.error_code, message, status_code=settings.http_service_unavailable. Calls super().__init__().
+              Exceptions --> Repo : DatabaseConnectionException raised.
+              deactivate Exceptions
+              Repo --> Tools : DatabaseConnectionException propagates to add_order.
+            end
+          end
+          deactivate Repo
+
+        end
+
+        Tools -> Tools : Building {order_id: str(order.order_id), order_sequence_id: order.order_sequence_id,\nstatus: order.status} and returning it.
+        Tools --> McpRuntime : Returns the order result dict.
+        McpRuntime --> client : Returns a success response with the order result.
+
+      end
+    end
+
+    group Tools Except Block (add_order)
+      Tools -> LogUtils : Calling log_and_raise() with the exception and source="tools.add_order"\nto write the error to error_logs and re-raise.
+      activate LogUtils
+      LogUtils -> LogUtils : log_and_raise: logs to DB then re-raises exc. — refer to 1.54 to 1.64 sequence number.
+      deactivate LogUtils
+      Tools --> McpRuntime : AppBaseException propagates to the MCP runtime.
+      McpRuntime --> client : Returns an error response with the relevant error code.
+    end
+  end
+  deactivate Tools
+
+end
+
+' ---------------- PROMPT INVOCATIONS ----------------
+
+group Service Layer: MCP Prompts
+
+  client -> McpRuntime : Client sends a prompt fetch request for brew_buddy_system with no arguments.
+  McpRuntime -> Prompts : FastMCP dispatches the request to brew_buddy_system().
+  activate Prompts
+
+  group Prompts Function: brew_buddy_system()
+    note right of Prompts
+    brew_buddy_system:
+    Main system prompt for Brew Buddy. Rewritten with XML section tags:
+    <role>, <objectives>, <instructions>, <output_format>, <constraints>.
+    Includes no-thinking instruction to suppress LLM reasoning traces.
+    check_inventory removed — check_menu covers availability questions.
+    end note
+    Prompts -> Prompts : Building the static system prompt string.\nNo database calls are needed since this is a hardcoded string.
+    Prompts --> McpRuntime : Returns the system prompt text.
+    McpRuntime --> client : Returns a success response with the brew_buddy_system prompt.
+  end
+  deactivate Prompts
+
+  client -> McpRuntime : Client sends a prompt fetch request for order_confirmation\nwith customer_name and items as arguments.
+  McpRuntime -> Prompts : FastMCP dispatches the request to order_confirmation(customer_name, items).
+  activate Prompts
+
+  group Prompts Function: order_confirmation(customer_name, items)
+    note right of Prompts
+    order_confirmation:
+    Generates a warm order confirmation message for the customer.
+    Called after add_order succeeds to produce a friendly reply.
+    Arguments: customer_name (str), items (str).
+    end note
+    Prompts -> Prompts : Filling in customer_name and items into the prompt template string.
+    Prompts -> Prompts : Building and returning the filled-in confirmation prompt string.
+    Prompts --> McpRuntime : Returns the confirmation prompt text.
+    McpRuntime --> client : Returns a success response with the order_confirmation prompt.
+  end
+  deactivate Prompts
+
+end
+
+' ---------------- RESOURCE INVOCATIONS ----------------
+
+group Service Layer: MCP Resources
+
+  client -> McpRuntime : Client sends a resource fetch request for menu://items\nto get the current live menu data.
+  McpRuntime -> Resources : FastMCP dispatches the request to get_menu_resource().
+  activate Resources
+
+  group Resources Function: get_menu_resource()
+    note right of Resources
+    get_menu_resource:
+    Returns all active menu items as a formatted text string.
+    Includes name, description, price in rupees, and stock availability.
+    Provides menu context for the agent alongside the check_menu tool.
+    end note
+
+    group Resources Try Block (get_menu_resource)
+
+      Resources -> Repo : Calling repo.get_menu_items(active_only=True) in coffee_repository.py\nto fetch all active menu items from the database.
+      activate Repo
+
+      group Repo Block: get_menu_items(active_only=True)
+        group Repo Try Block
+          Repo -> DB : Calling get_db() to open a session.
+          activate DB
+          DB --> Repo : Yields the SQLAlchemy session.
+          Repo -> DB : ORM: session.query(MenuItemSchema)\n.filter(MenuItemSchema.is_active.is_(True))\n.order_by(MenuItemSchema.name.asc()).all()
+          DB --> Repo : Returns the list of active MenuItemSchema rows.
+          Repo -> Repo : Calling session.expunge(item) for each item to detach them from the session.
+          deactivate DB
+          Repo --> Resources : Returns the list of MenuItemSchema objects.
+        end
+        group Repo Except Block
+          Repo -> Exceptions : Calling DatabaseConnectionException.__init__("Failed to fetch menu items: ...").
+          activate Exceptions
+          Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.DB_CONNECTION_FAILED, "BB_DB_001").
+          ErrorCodes --> Exceptions : Returns "BB_DB_001".
+          Exceptions -> Exceptions : Sets self.error_code, message, status_code=settings.http_service_unavailable. Calls super().__init__().
+          Exceptions --> Repo : DatabaseConnectionException raised.
+          deactivate Exceptions
+          Repo --> Resources : DatabaseConnectionException propagates to get_menu_resource.
+        end
+      end
+      deactivate Repo
+
+      Resources -> Resources : Looping over each menu item and formatting it as\n"- {name}: {description} | Rs. {price} | In Stock / Out of Stock".\nJoining all lines and prepending "Bean & Brew Menu:\n".
+      Resources --> McpRuntime : Returns the formatted menu text string.
+      McpRuntime --> client : Returns a success response with the menu resource text.
+
+    end
+    group Resources Except Block (get_menu_resource)
+      Resources -> LogUtils : Calling log_and_raise() with the exception and source="resources.get_menu_resource"\nto write the error to error_logs and re-raise.
+      activate LogUtils
+      LogUtils -> LogUtils : log_and_raise: logs to DB then re-raises exc. — refer to 1.54 to 1.64 sequence number.
+      deactivate LogUtils
+      Resources --> McpRuntime : AppBaseException propagates to the MCP runtime.
+      McpRuntime --> client : Returns an error response with the relevant error code.
+    end
+  end
+  deactivate Resources
+
+  client -> McpRuntime : Client sends a resource fetch request for store://info\nto get the static store details.
+  McpRuntime -> Resources : FastMCP dispatches the request to get_store_info().
+  activate Resources
+
+  group Resources Function: get_store_info()
+    note right of Resources
+    get_store_info:
+    Returns static Bean & Brew store information.
+    Includes opening hours, location, contact details, and policies.
+    Read this when the customer asks about store details.
+    end note
+    Resources -> Resources : Returning the hardcoded store info string.\nNo database calls needed since this data does not change.
+    Resources --> McpRuntime : Returns the store info text string.
+    McpRuntime --> client : Returns a success response with the store info resource text.
+  end
+  deactivate Resources
+
+end
+
+@enduml

@@ -1,0 +1,744 @@
+@startuml sequence_diagram_for_BeanBrew_Client_Task5_Updated
+!theme plain
+skinparam sequenceMessageAlign center
+skinparam maxMessageSize 1000
+skinparam noteBackgroundColor lightyellow
+skinparam noteTextColor black
+autonumber 1.0
+
+title Bean & Brew Client - Chat Flow
+
+actor client
+participant "client/main.py\n(FastAPI app)" as Main
+participant "client/router/chat.py\n(APIRouter)" as Router
+participant "client/models/schemas.py\n(Pydantic DTOs)" as Dtos
+participant "client/services/chat_service.py\n(ChatService)" as Service
+participant "client/agent/mcp_client.py\n(MCP Client)" as McpClient
+participant "client/utils/helpers.py\n(LLM + Bedrock)" as Helpers
+participant "client/utils/exceptions/custom_exceptions.py\n(AppBaseException)" as Exceptions
+participant "client/utils/exceptions/error_codes.py\n(ErrorCode)" as ErrorCodes
+participant "client/settings.py\n(Settings)" as ClientSettings
+participant "client/.env" as Env
+participant "Bedrock LLM\n(ChatBedrock)" as LLM
+participant "MCP Server\n(FastMCP)" as McpServer
+participant "AsyncPostgresSaver\n(langgraph.checkpoint.postgres.aio)" as Checkpointer
+participant "SummarizationMiddleware\n(langchain.agents.middleware)" as SummaryMiddleware
+participant "PIIMiddleware\n(langchain.agents.middleware)" as PIIMiddlewareParticipant
+participant "HumanInTheLoopMiddleware\n(langchain.agents.middleware)" as HITLMiddleware
+
+note over Main
+FastAPI app startup:
+- lifespan prints "Starting Bean & Brew Client API..." on startup and "Shutting down..." on shutdown
+- CORS middleware allows requests from any origin, method, and header
+- AppBaseException handler returns JSON with error_code and message at its own status code
+- Generic Exception handler returns HTTP 500
+- Route-level try/except runs first, global handlers are the fallback
+end note
+
+note over Main
+Imports:
+- uvicorn
+- contextlib: asynccontextmanager
+- fastapi: FastAPI, Request
+- fastapi.responses: JSONResponse
+- fastapi.middleware.cors: CORSMiddleware
+- router.chat: router as chat_router
+- utils.exceptions.custom_exceptions: AppBaseException
+- settings: settings
+end note
+
+note over Router
+POST /api/v1/chat
+Returns ChatResponse as JSON
+end note
+
+note over Router
+Imports:
+- fastapi: APIRouter
+- fastapi.responses: JSONResponse
+- models.schemas: ChatRequest, ChatResponse
+- services.chat_service: ChatService
+- utils.exceptions.custom_exceptions: AppBaseException
+- settings: settings
+end note
+
+note over Dtos
+ChatRequest: message (str), mode (str, default="normal"), stream (bool, default=False), thread_id (str, default="default")
+OrderItem: item (str), quantity (int, must be > 0), price (Optional[float])
+OrderDetails: customer_name (Optional[str]), items (List[OrderItem])
+PendingApproval: tool (str), args (Dict[str, Any]), description (str)
+ChatResponse: message (str), structured_output (Optional[OrderDetails]),
+  stream_chunks (Optional[List[str]]), pending_approval (Optional[PendingApproval])
+
+end note
+
+note over Dtos
+Imports:
+- typing: Any, Dict, List, Optional
+- pydantic: BaseModel, Field
+end note
+
+note over Service
+Imports:
+- typing: Optional
+- models.schemas: ChatRequest, ChatResponse, OrderDetails, PendingApproval
+- agent.mcp_client: run_agent, stream_agent, run_structured_agent, resume_agent
+- utils.exceptions.custom_exceptions: AppBaseException, InvalidRequestException
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+- settings: settings
+end note
+
+note over McpClient
+Module-level helpers:
+  get_client() — creates MultiServerMCPClient pointing to settings.mcp_server_url
+  get_db_uri() — builds PostgreSQL URI from settings fields with quote_plus password encoding
+  get_pii_middleware() — returns 3 PIIMiddleware instances (email redact, credit_card mask, phone redact)
+  get_summarization_middleware() — builds SummarizationMiddleware with dedicated summary LLM
+  get_hitl_middleware() — returns HumanInTheLoopMiddleware configured for add_order approval only;
+    check_menu and check_order_status are False (auto-approved, no interrupt)
+  load_session_context(session) — loads tools + system prompt + all resources unconditionally,
+    returns (tools, system_text) ready for agent creation
+  extract_pending_approval(result) — inspects result["__interrupt__"] and returns
+    {tool, args, description} if a HITL interrupt is pending, or None if agent completed
+  resume_agent(decision, thread_id) — rebuilds agent with same middleware and checkpointer,
+    then calls ainvoke(Command(resume={"decisions": [{"type": decision}]})) to continue
+    from the saved interrupt point in the checkpointer
+  has_pending_interrupt(thread_id)
+    checks if result["__interrupt__"] is present
+
+All resources (menu://items, store://info) are always loaded unconditionally.
+No intent detection or resource filtering.
+
+Imports:
+- typing: Any, Dict, List
+- urllib.parse: quote_plus
+- langchain_mcp_adapters.client: MultiServerMCPClient
+- langchain_mcp_adapters.tools/prompts/resources: load_mcp_tools, load_mcp_prompt, load_mcp_resources
+- langchain.agents: create_agent
+- langchain.agents.middleware: SummarizationMiddleware, PIIMiddleware, HumanInTheLoopMiddleware
+- langchain.agents.structured_output: ToolStrategy
+- langchain_core.messages: SystemMessage, HumanMessage, AIMessage
+- langchain_core.runnables: RunnableConfig
+- langgraph.checkpoint.postgres.aio: AsyncPostgresSaver
+- langgraph.types: Command
+- settings: settings
+- utils.helpers: get_llm
+- utils.exceptions.custom_exceptions: AppBaseException, InvalidRequestException
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+end note
+
+note over Helpers
+Imports:
+- boto3
+- langchain_aws: ChatBedrock
+- settings: settings
+- utils.exceptions.custom_exceptions: AppBaseException
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+end note
+
+note over Exceptions
+AppBaseException.__init__(error_code, message, status_code):
+  Sets self.error_code, self.message, self.status_code
+  Calls super().__init__(self.message)
+
+InvalidRequestException.__init__(detail):
+  Calls ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001") → "BB_REQ_001"
+  Calls super().__init__(error_code="BB_REQ_001", message=detail, status_code=settings.http_bad_request)
+
+Imports:
+- utils.exceptions.error_codes: ErrorCode, ErrorCodeStatus
+end note
+
+note over ClientSettings
+HTTP status codes stored in settings (used everywhere instead of hardcoded numbers):
+  http_ok = 200, http_created = 201, http_bad_request = 400
+  http_not_found = 404, http_internal_server_error = 500, http_service_unavailable = 503
+
+Imports:
+- dotenv: load_dotenv
+- os
+end note
+
+note over Env
+client/.env keys used:
+HOST, PORT, AWS_REGION, MODEL_ID, MODEL_PROVIDER,
+MAX_TOKENS, TEMPERATURE, MCP_SERVER_URL,
+DB_HOST, DB_PORT, DB_NAME, DB_USERNAME, DB_PASSWORD,
+SUMMARY_MAX_TOKENS, SUMMARY_KEEP_MESSAGES
+end note
+
+activate Main
+
+group APPLICATION Startup
+
+  Main -> Main : Calling FastAPI() with title, version, and lifespan\nto create the app instance that handles all HTTP requests.\nLifespan context manager prints startup and shutdown messages.
+
+  Main -> Main : Calling app.add_middleware() with CORSMiddleware and allow_origins=["*"]\nto let the API accept requests from any domain, method, and header.\nThis is needed so browser clients on different origins can call the API.
+
+  Main -> Main : Calling app.include_router(chat_router) with the router from router/chat.py\nto register POST /api/v1/chat on the FastAPI app.\nWithout this the route would not exist.
+
+  Main -> ClientSettings : Reading settings.host and settings.port\nto get the host and port for uvicorn.
+  ClientSettings -> Env : Reading HOST and PORT from .env via os.getenv().
+  Env --> ClientSettings : Returns HOST and PORT strings.
+  ClientSettings --> Main : Returns host string and port int.
+
+  Main -> Main : Calling uvicorn.run() with host, port from settings, and reload=True\nto start the ASGI web server that listens for incoming HTTP requests.\nreload=True restarts the server automatically when source files change.
+
+end group
+
+client -> client : Client prepares the HTTP POST request body as JSON\nwith message, mode, stream, and thread_id filled in.\nthread_id is sent to continue the same conversation session.
+note right of client
+Body:
+{
+  "message": "What coffees do you have?",
+  "mode": "normal",
+  "stream": false,
+  "thread_id": "user-session-id"
+}
+end note
+
+client -> Main : Client sends HTTP POST to http://0.0.0.0:8080/api/v1/chat with the JSON body.\nThis is the only entry point for all chat interactions with the agent.\nThe request carries the user message and session details.
+
+Main -> Router : FastAPI receives the request and routes POST /api/v1/chat\nto the chat() function in client/router/chat.py.\nThe ASGI layer does this routing automatically.
+activate Router
+
+Router -> Dtos : FastAPI passes the raw JSON body to Pydantic\nto parse and validate each field against the ChatRequest model definition.\nIf a required field is missing or the wrong type, Pydantic raises a validation error.
+activate Dtos
+
+group Pydantic ChatRequest Validation
+  Dtos -> Dtos : Checking that message field is present and is a str.\nChecking that mode is a str — defaults to "normal" if not provided.\nChecking that stream is a bool — defaults to False if not provided.\nChecking that thread_id is a str — defaults to "default" if not provided.
+
+  alt Pydantic Validation FAIL
+    Dtos --> Router : Pydantic raises RequestValidationError\nwith a list describing which fields failed and why.\nThe chat() handler never runs in this case.
+    deactivate Dtos
+    Router -> client : FastAPI returns HTTP 422 Unprocessable Entity\nbefore the handler runs, with JSON showing the validation errors.\nThe client must fix the request body and try again.
+    note right
+    {"detail": [{"loc": ["body","message"], "msg": "field required", "type": "missing"}]}
+    end note
+  else Pydantic Validation OK
+    Dtos --> Router : Pydantic returns a validated ChatRequest instance\nwith message, mode, stream, and thread_id populated.\nThe chat() handler now runs with this object.
+    deactivate Dtos
+  end
+end
+
+group Router Block: chat(request)
+  group Router Try Block
+
+    Router -> Service : Calling process_chat(request) on a new ChatService() instance\nin client/services/chat_service.py with the validated ChatRequest.\nThis is the main entry point that routes to the right agent mode.
+    activate Service
+
+    group Service Block: process_chat(request)
+      group Service Try Block
+
+        Service -> Service : Calling request.mode.lower().strip()\nto normalise the mode value so "Normal", "NORMAL", and " normal " all match "normal".\nThis prevents routing failures caused by different casing or whitespace.
+
+        alt mode == "structured"
+
+          Service -> Service : Calling process_structured(request)\nto delegate structured output handling to a private method in the same class.\nThis keeps structured flow separate from normal and stream flows.
+
+          group Service Block: process_structured(request)
+            group Service Try Block (process_structured)
+
+              Service -> McpClient : Calling run_structured_agent() with request.message, OrderDetails, and request.thread_id\nin client/agent/mcp_client.py to run the agent in structured output mode.\nOrderDetails is passed so the agent knows the JSON shape it must return.
+              activate McpClient
+
+              group MCP Client Block: run_structured_agent(message, response_format, thread_id)
+                group MCP Client Try Block (run_structured_agent)
+
+                  McpClient -> McpClient : Calling get_client() to create a MultiServerMCPClient\nwith a "bean-brew-tools" entry pointing to settings.mcp_server_url using streamable_http.\nThis client is used to open the session to the MCP server.
+                  McpClient -> ClientSettings : Reading settings.mcp_server_url\nto get the MCP server URL for the MultiServerMCPClient.
+                  ClientSettings -> Env : Reading MCP_SERVER_URL from .env via os.getenv().
+                  Env --> ClientSettings : Returns MCP_SERVER_URL string.
+                  ClientSettings --> McpClient : Returns mcp_server_url string.
+                  McpClient --> McpClient : Returns the MultiServerMCPClient instance.
+
+                  McpClient -> McpClient : Calling client.session("bean-brew-tools") as an async context manager\nto open and hold an HTTP connection to the MCP server for this request.\nThis connection is used for all tool, prompt, and resource calls below.
+
+                  McpClient -> McpClient : Calling load_session_context(session) to load tools, system prompt,\nand all resources unconditionally into system_text in one step.\nAll resources (menu://items, store://info) are always included — no intent filtering.
+                  McpClient --> McpClient : Returns (tools, system_text) ready for agent creation.
+
+                  McpClient -> ClientSettings : Reading settings.db_username, settings.db_password,\nsettings.db_host, settings.db_port, settings.db_name\nto build the PostgreSQL connection URI for the checkpointer.
+                  ClientSettings -> Env : Reading DB_USERNAME, DB_PASSWORD, DB_HOST, DB_PORT, DB_NAME\nfrom .env via os.getenv().
+                  Env --> ClientSettings : Returns the five DB credential strings.
+                  ClientSettings --> McpClient : Returns db_username, db_password, db_host, db_port, db_name.
+
+                  McpClient -> Checkpointer : Calling AsyncPostgresSaver.from_conn_string() with the database URI\nbuilt by get_db_uri() from settings fields with quote_plus encoding the password.\nOpens the async checkpointer context manager that loads and saves conversation state per thread_id.
+                  Checkpointer --> McpClient : Returns the AsyncPostgresSaver context manager.
+
+                  McpClient -> Checkpointer : Calling await checkpointer.setup()\nto create the langgraph checkpoint tables in PostgreSQL if they do not exist yet.\nEnsures memory tables are ready before the agent runs.
+
+                  McpClient -> McpClient : Calling get_summarization_middleware()\nto create SummarizationMiddleware with a dedicated summary LLM.
+                  activate McpClient
+
+                  group MCP Client Block: get_summarization_middleware()
+                    McpClient -> ClientSettings : Reading settings.summary_max_tokens\nto get the max tokens for the summary LLM.
+                    ClientSettings -> Env : Reading SUMMARY_MAX_TOKENS from .env via os.getenv().
+                    Env --> ClientSettings : Returns SUMMARY_MAX_TOKENS string.
+                    ClientSettings --> McpClient : Returns summary_max_tokens int.
+
+                    McpClient -> Helpers : Calling get_llm() with max_tokens=settings.summary_max_tokens and temperature=0\nto create a dedicated ChatBedrock LLM for summarization.\ntemperature=0 makes summaries deterministic.
+                    activate Helpers
+
+                    group Helpers Block: get_llm(max_tokens, temperature)
+                      Helpers -> ClientSettings : Reading settings.model_id to get the Bedrock model ARN from .env.\nThis value identifies which model boto3 should send requests to.\nIf it is empty the helper raises an error because no model can be called.
+                      ClientSettings -> Env : Reading MODEL_ID from .env via os.getenv().
+                      Env --> ClientSettings : Returns MODEL_ID string.
+                      ClientSettings --> Helpers : Returns model_id string.
+
+                      alt model_id is empty
+                        Helpers -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.INTERNAL_SERVER_ERROR)="BB_SYS_001",\nmessage="MODEL_ID is required for Bedrock.", status_code=settings.http_internal_server_error.
+                        activate Exceptions
+                        Exceptions -> ErrorCodes : Reading ErrorCodeStatus.get(ErrorCode.INTERNAL_SERVER_ERROR, "BB_SYS_001")\nto resolve the error code string "BB_SYS_001".
+                        ErrorCodes --> Exceptions : Returns "BB_SYS_001".
+                        Exceptions -> Exceptions : Setting self.error_code="BB_SYS_001", self.message, self.status_code=500.\nCalling super().__init__(self.message) to initialise the base Exception.
+                        Exceptions --> Helpers : AppBaseException instance created and raised.
+                        deactivate Exceptions
+                        Helpers --> McpClient : AppBaseException propagates to _get_summarization_middleware.
+                      else model_id is present
+                        Helpers -> Helpers : Calling get_bedrock_client() which calls boto3.client("bedrock-runtime")\nwith the region from settings to create an authenticated Bedrock runtime client.\nThis client handles signing and routing requests to AWS Bedrock.
+                        Helpers -> ClientSettings : Reading settings.aws_region to get the AWS region for the Bedrock runtime client.
+                        ClientSettings -> Env : Reading AWS_REGION from .env via os.getenv().
+                        Env --> ClientSettings : Returns AWS_REGION string.
+                        ClientSettings --> Helpers : Returns aws_region string.
+                        Helpers --> Helpers : Returns the boto3 bedrock-runtime client.
+                        Helpers -> LLM : Calling ChatBedrock() with bedrock_client, model_id, provider, and model_kwargs\nto create the LangChain LLM wrapper that routes calls through the Bedrock runtime.\nmax_tokens and temperature are passed in model_kwargs.
+                        LLM --> Helpers : Returns the configured ChatBedrock instance.
+                        Helpers --> McpClient : Returns the ChatBedrock llm to the caller.
+                      end
+                    end
+                    deactivate Helpers
+
+                    McpClient -> McpClient : Calling SummarizationMiddleware() with summary_llm,\ntrigger=[("tokens", 2000), ("messages", 10)], and keep=("messages", settings.summary_keep_messages)\nto build middleware that compresses old messages when either threshold is hit.
+                    McpClient --> McpClient : Returns the configured SummarizationMiddleware instance.
+                  end
+                  deactivate McpClient
+
+                  McpClient -> Helpers : Calling get_llm() with max_tokens=500 and temperature=0\nin client/utils/helpers.py to get a ChatBedrock LLM for structured output.\ntemperature=0 makes output deterministic which is needed for reliable schema extraction.
+                  activate Helpers
+                  Helpers -> Helpers : get_llm(): checks MODEL_ID, creates boto3 client and ChatBedrock. \nrefer to 1.42 to 1.60 sequence number.
+
+                  Helpers --> McpClient : Returns ChatBedrock llm to the caller.
+            
+                  deactivate Helpers
+
+                  McpClient -> McpClient : Calling create_agent() with llm, tools, system_prompt=SystemMessage(system_text),\nresponse_format=ToolStrategy(OrderDetails),\nmiddleware=get_pii_middleware() + [get_summarization_middleware(), get_hitl_middleware()], and checkpointer.\nPIIMiddleware redacts PII before the model sees it; HumanInTheLoopMiddleware intercepts add_order.\nBuilds the ReAct agent that returns structured output matching the OrderDetails schema.
+                  McpClient --> McpClient : Returns the configured agent runnable.
+
+                  McpClient -> McpClient : Calling RunnableConfig() with configurable={"thread_id": thread_id}\nto create the config object that tells the checkpointer which session history to load from PostgreSQL.\nThe same thread_id must be sent across turns to continue the same conversation.
+                  McpClient --> McpClient : Returns the RunnableConfig instance.
+
+                  McpClient -> McpClient : Calling await agent.ainvoke() with [HumanMessage(content=message)] and config\nto run the agent passing only the new user message since the checkpointer loads prior history.\nThe ReAct loop runs: LLM call, tool call if needed, final response.
+
+                  alt agent needs a tool call
+                    McpClient -> McpServer : Agent sends the tool call with name and arguments to the MCP server\nover the active streamable_http session to execute check_menu, check_order_status, or add_order.\nThe MCP server runs the tool and returns the result.
+                    McpServer --> McpClient : Returns the tool result as a ToolMessage with structured JSON content.
+                  end
+
+                  McpClient --> McpClient : Returns the full agent result dict from ainvoke().
+
+                  McpClient -> McpClient : Calling result.get("structured_response") to read the structured output\nfrom the agent result dict that ToolStrategy fills with a parsed OrderDetails instance.\nIf None, the agent did not return output in the expected shape.
+
+                  alt structured_response is None
+                    McpClient -> Exceptions : Calling InvalidRequestException.__init__("No structured output returned.").
+                    activate Exceptions
+                    Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001")\nto resolve the error code string.
+                    ErrorCodes --> Exceptions : Returns "BB_REQ_001".
+                    Exceptions -> Exceptions : Setting self.error_code="BB_REQ_001", self.message, self.status_code=400.\nCalling super().__init__() which calls AppBaseException.__init__() then Exception.__init__().
+                    Exceptions --> McpClient : InvalidRequestException raised.
+                    deactivate Exceptions
+                    McpClient --> McpClient : Exception caught in except AppBaseException block — re-raised.
+                  else structured_response is present
+                    McpClient -> McpClient : Checking if structured is already an OrderDetails instance.\nIf not, calling OrderDetails(**structured) to turn the dict into the Pydantic model.\nThis runs field-level validation on the structured output.
+                    alt items list is empty
+                      McpClient -> Exceptions : Calling InvalidRequestException.__init__("Requested item is not on our menu...").
+                      activate Exceptions
+                      Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001").
+                      ErrorCodes --> Exceptions : Returns "BB_REQ_001".
+                      Exceptions -> Exceptions : Setting self.error_code="BB_REQ_001", self.message, self.status_code=400.\nCalling super().__init__().
+                      Exceptions --> McpClient : InvalidRequestException raised.
+                      deactivate Exceptions
+                      McpClient --> McpClient : Exception caught — re-raised.
+                    else items list has entries
+                      McpClient -> McpClient : Checking if customer_name is None or empty\nand setting it to "Guest" so the confirmation message always has a name to use.\nThis avoids passing a None value into the confirmation prompt.
+                      McpClient -> McpClient : Setting result["structured_response"] = structured_output\nto replace the raw dict in the result with the validated OrderDetails instance.\nThis is what the service layer reads back.
+                      McpClient --> Service : Returns the full agent result dict with structured_response and messages.
+                    end
+                  end
+                end
+                group MCP Client Except Block (run_structured_agent)
+                  McpClient -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.CHAT_STRUCTURED_FAILED)="BB_CHAT_002",\nmessage="Structured agent failed: {str(exc)}", status_code=500.
+                  activate Exceptions
+                  Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.MCP_AGENT_INVOKE_FAILED, "BB_MCP_002").
+                  ErrorCodes --> Exceptions : Returns "BB_MCP_002".
+                  Exceptions -> Exceptions : Setting self.error_code="BB_MCP_002", self.message, self.status_code=settings.http_internal_server_error.\nCalling super().__init__(self.message).
+                  Exceptions --> McpClient : AppBaseException instance raised.
+                  deactivate Exceptions
+                  McpClient --> Service : AppBaseException propagates to process_structured.
+                end
+              end
+              deactivate McpClient
+
+              Service -> Service : Calling result.get("structured_response") to read the OrderDetails instance\nfrom the agent result returned by run_structured_agent.\nThis is a safety check before building the confirmation message.
+
+              alt structured is None
+                Service -> Exceptions : Calling InvalidRequestException.__init__("No structured output returned.").
+                activate Exceptions
+                Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.INVALID_REQUEST, "BB_REQ_001").
+                ErrorCodes --> Exceptions : Returns "BB_REQ_001".
+                Exceptions -> Exceptions : Setting self.error_code="BB_REQ_001", self.message, self.status_code=400.\nCalling super().__init__().
+                Exceptions --> Service : InvalidRequestException raised.
+                deactivate Exceptions
+                Service --> Service : Exception caught — re-raised to process_structured except block.
+              else structured is present
+
+                Service -> Service : Checking if structured is already an OrderDetails instance.\nIf not, calling OrderDetails(**structured) to validate the dict into the Pydantic model.\nThis runs field-level validation on items and customer_name.
+                Service --> Service : Returns the validated OrderDetails instance as structured_output.
+
+                Service -> Service : Setting final_message = "Structured output generated." as the default,\nthen using the last AIMessage content from result["messages"] if available.
+
+                                Service -> Service : Calling ChatResponse() with message=final_message and structured_output=structured_output\nto build the response with both the confirmation text and the parsed order details.\nThe router serialises this to JSON and returns it to the client.
+                Service --> Service : Returns the ChatResponse instance.
+              end
+            end
+            group Service Except Block (process_structured)
+              Service -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.CHAT_STRUCTURED_FAILED)="BB_CHAT_002",\nmessage="Structured chat processing failed: {str(exc)}", status_code=500.
+              activate Exceptions
+              Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.CHAT_STRUCTURED_FAILED, "BB_CHAT_002").
+              ErrorCodes --> Exceptions : Returns "BB_CHAT_002".
+              Exceptions -> Exceptions : Setting self.error_code="BB_CHAT_002", self.message, self.status_code=settings.http_internal_server_error.\nCalling super().__init__(self.message).
+              Exceptions --> Service : AppBaseException raised.
+              deactivate Exceptions
+              Service --> Router : AppBaseException propagates to process_chat then to Router.
+            end
+          end
+          Service --> Service : Returns ChatResponse from process_structured to process_chat.
+
+        else request.stream == true
+
+          Service -> McpClient : Calling stream_agent() with request.message and request.thread_id\nin client/agent/mcp_client.py to run the agent in streaming mode.\nThe agent yields response chunks as they are generated instead of waiting for the full reply.
+          activate McpClient
+
+          group MCP Client Block: stream_agent(message, thread_id)
+            group MCP Client Try Block (stream_agent)
+
+              McpClient -> McpClient : Calling get_client() to create a MultiServerMCPClient\npointing to settings.mcp_server_url with streamable_http transport.
+              McpClient --> McpClient : Returns the MultiServerMCPClient instance.
+
+              McpClient -> McpClient : Calling client.session("bean-brew-tools") as an async context manager\nto open a connection to the MCP server that stays open for all MCP calls.\nThe session closes when the context manager exits.
+
+              McpClient -> McpClient : Calling load_session_context(session) to load tools, system prompt,\nand all resources unconditionally in one step. — refer to 1.27 to 1.28 sequence number.
+              McpClient --> McpClient : Returns (tools, system_text) ready for agent creation.
+
+              McpClient -> Checkpointer : Calling AsyncPostgresSaver.from_conn_string() with the database URI\nto open the async checkpointer for persistent memory storage per thread_id.\nThe URI is built from settings fields with the password URL-encoded by quote_plus.
+              Checkpointer --> McpClient : Returns the AsyncPostgresSaver context manager.
+
+              McpClient -> Checkpointer : Calling await checkpointer.setup()\nto create checkpoint tables in PostgreSQL if they do not already exist.\nEnsures memory tables are ready before the agent starts.
+
+              McpClient -> McpClient : get_summarization_middleware(): creates SummarizationMiddleware with summary LLM. — \nrefer to 1.37 to 1.62 sequence number.
+
+              McpClient -> ClientSettings : Reading settings.max_tokens and settings.temperature\nto get the main agent LLM parameters.
+              ClientSettings -> Env : Reading MAX_TOKENS and TEMPERATURE from .env via os.getenv().
+              Env --> ClientSettings : Returns MAX_TOKENS and TEMPERATURE strings.
+              ClientSettings --> McpClient : Returns max_tokens int and temperature float.
+
+              McpClient -> Helpers : Calling get_llm() with max_tokens and temperature from settings\nto create a ChatBedrock LLM with the normal agent config from .env.
+              activate Helpers
+              Helpers -> Helpers : get_llm(): checks MODEL_ID, creates boto3 client and ChatBedrock. \nrefer to 1.42 to 1.60 sequence number.
+              Helpers --> McpClient : Returns the ChatBedrock llm to the caller.
+            
+              deactivate Helpers
+
+              McpClient -> McpClient : Calling create_agent() with llm, tools, system_prompt=SystemMessage(system_text),\nmiddleware=get_pii_middleware() + [get_summarization_middleware(), get_hitl_middleware()], and checkpointer.\nBuilds the ReAct agent with PII protection, summarization, HITL approval, and persistent memory.
+              McpClient --> McpClient : Returns the configured agent runnable.
+
+              McpClient -> McpClient : Calling RunnableConfig() with configurable={"thread_id": thread_id}\nto create the config the checkpointer reads to find the right conversation history.\nUsing the same thread_id across turns continues the same session.
+              McpClient --> McpClient : Returns the RunnableConfig instance.
+
+              McpClient -> McpClient : Printing "[Brew Buddy Streaming]" to the terminal with flush=True\nto mark in the server logs that the streaming response has started.\nThis pairs with the "[Stream End]" marker printed after the loop.
+
+              McpClient -> McpClient : Calling await agent.astream() with [HumanMessage(content=message)], config, and stream_mode="messages"\nto run the agent in streaming mode where each message chunk is yielded as it is generated.\nThe checkpointer loads prior history so only the new user message is passed here.
+
+              group Tool Invocation during streaming
+                McpClient -> McpServer : Agent sends the tool call with name and arguments to the MCP server\nover the active streamable_http session to execute check_menu, check_order_status, or add_order.\nThe MCP server runs the tool and returns the result.
+                McpServer --> McpClient : Returns the tool result as a ToolMessage with structured JSON content.
+                note over McpClient,McpServer
+                When the agent needs a tool call mid-stream, it pauses and sends the call to the MCP server.
+                The MCP server runs the tool, does any database work, and returns a ToolMessage.
+                The agent resumes streaming the final response after getting the tool result back.
+                end note
+              end
+
+              loop for each chunk from agent.astream()
+                McpClient -> McpClient : Unpacking chunk as (msg, metadata) from the stream.\nChecking if the msg is an AIMessage with non-empty content\nto skip ToolMessages, HumanMessages, and empty AIMessage chunks with no text.
+
+                McpClient -> McpClient : Extracting the text value from the chunk content\nwhich is either a plain string or a list of content blocks where block type is "text".\nThe extracted text is the actual words the model is generating.
+
+                McpClient -> McpClient : Calling print(chunk_text, end="", flush=True)\nto write the chunk to the terminal right away without buffering.\nThis shows the response building up in the server logs as it streams.
+
+                McpClient -> McpClient : Calling chunks.append(chunk_text)\nto add the chunk to the list that will be returned to the service when streaming ends.\nAll chunks joined together form the complete agent response.
+              end
+
+              McpClient -> McpClient : Printing "[Stream End]" with flush=True\nto mark in the server logs that the streaming response has finished.
+
+              McpClient --> Service : Returns chunks[] — the list of all text chunks from the streaming agent.
+            end
+            group MCP Client Except Block (stream_agent)
+              McpClient -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.MCP_STREAM_FAILED)="BB_MCP_003",\nmessage="Streaming agent failed: {str(exc)}", status_code=settings.http_internal_server_error.
+              activate Exceptions
+              Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.MCP_STREAM_FAILED, "BB_MCP_003").
+              ErrorCodes --> Exceptions : Returns "BB_MCP_003".
+              Exceptions -> Exceptions : Setting self.error_code="BB_MCP_003", self.message, self.status_code=settings.http_internal_server_error.\nCalling super().__init__(self.message).
+              Exceptions --> McpClient : AppBaseException raised.
+              deactivate Exceptions
+              McpClient --> Service : AppBaseException propagates to process_chat.
+            end
+          end
+          deactivate McpClient
+
+          Service -> Service : Calling "".join(chunks) to join all chunk strings into one full message string.\nThis gives the full response text in a single variable alongside the original chunks list.\nBoth are put into the ChatResponse below.
+
+          Service -> Service : Calling ChatResponse() with message and stream_chunks=chunks\nto build the response with the full text and the individual chunks.\nThe client can use message directly or replay the chunks for animation.
+          Service --> Service : Returns the ChatResponse instance.
+
+        else normal mode
+
+          ' Service -> Service : Calling detect_hitl_decision(request.message) to normalise the message\nto lowercase, strip punctuation, and check against APPROVE_KEYWORDS and REJECT_KEYWORDS.\nReturns "approve", "reject", or None.
+          Service -> McpClient : Calling await has_pending_interrupt(request.thread_id)\nto open the checkpointer and check if this thread has a paused HITL interrupt saved.
+          McpClient -> Checkpointer : Calling aget({"configurable": {"thread_id": thread_id}})\nto fetch the saved graph state for this thread.
+          Checkpointer --> McpClient : Returns the checkpoint state or None.
+          McpClient --> Service : Returns True if __interrupt__ is present in state, False otherwise.
+
+      alt has_pending_interrupt returns True
+            Service -> Service : User message is a HITL decision - passing request.message\n directly as the decision without any keyword matching or normalisation.
+            Service -> Service : Calling process_hitl_decision(thread_id, request.message).
+
+            group Service Block: process_hitl_decision(thread_id, decision)
+              group Service Try Block (process_hitl_decision)
+
+                Service -> McpClient : Calling resume_agent(decision, thread_id)\nto rebuild the agent with the same middleware and checkpointer\nand resume it with Command(resume={"decisions": [{"type": decision}]}).
+                activate McpClient
+
+                group MCP Client Block: resume_agent(decision, thread_id)
+                  group MCP Client Try Block (resume_agent)
+
+                    McpClient -> McpClient : Calling get_client(), session("bean-brew-tools"),\nload_session_context() to rebuild tools and system_text. \n— refer to 1.20 to 1.28 sequence number.
+
+                    McpClient -> Checkpointer : Calling AsyncPostgresSaver.from_conn_string() and checkpointer.setup()\nto open the same checkpointer that holds the paused graph state for this thread_id.
+                    Checkpointer --> McpClient : Returns the AsyncPostgresSaver context manager.
+
+                    McpClient -> McpClient : Calling create_agent() with the same llm, tools, system_prompt,\nmiddleware=get_pii_middleware() + [get_summarization_middleware(), get_hitl_middleware()],\nand checkpointer.
+                    McpClient --> McpClient : Returns the configured agent runnable.
+
+                    McpClient -> McpClient : Calling RunnableConfig() with configurable={"thread_id": thread_id}\nso the checkpointer knows which saved graph state to restore for the resume.
+                    McpClient --> McpClient : Returns the RunnableConfig instance.
+
+                    McpClient -> McpClient : Calling await agent.ainvoke(\nCommand(resume={"decisions": [{"type": decision}]}), config)\nto continue execution from the interrupt point saved in the checkpointer.\nLangGraph restores the full graph state and runs from the interrupted node.
+
+                    alt decision is "approve"
+                      McpClient -> McpServer : Agent resumes and sends the add_order tool call\nto the MCP server with the original arguments that were intercepted.\nThe MCP server executes add_order, creates the order, and reduces stock.
+                      McpServer -> McpServer : The add_order tool call will be processed in our MCP_SERVER after the user approval.
+                      McpServer --> McpClient : Returns the add_order tool result with order_id, order_sequence_id, and status.
+                      McpClient --> McpClient : Agent produces final AIMessage confirming the order.
+                    else decision is "reject"
+                      McpClient -> McpClient : Agent skips the add_order call and produces\nan AIMessage explaining the order was cancelled.
+                    end
+
+                    McpClient -> McpClient : Reading result["messages"][-1].content\nto get the final AIMessage text after the resume completed.
+                    McpClient --> Service : Returns the final response string.
+
+                  end
+                  group MCP Client Except Block (resume_agent)
+                    McpClient -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.MCP_AGENT_INVOKE_FAILED)="BB_MCP_002",\nmessage="Agent resume failed: {str(exc)}", status_code=settings.http_internal_server_error.
+                    activate Exceptions
+                    Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.MCP_AGENT_INVOKE_FAILED, "BB_MCP_002").
+                    ErrorCodes --> Exceptions : Returns "BB_MCP_002".
+                    Exceptions -> Exceptions : Setting self.error_code, self.message, self.status_code.\nCalling super().__init__(self.message).
+                    Exceptions --> McpClient : AppBaseException raised.
+                    deactivate Exceptions
+                    McpClient --> Service : AppBaseException propagates to process_hitl_decision.
+                  end
+                end
+                deactivate McpClient
+
+                Service -> Service : Calling ChatResponse(message=message) to wrap the\nresumed agent response in a ChatResponse.\npending_approval is None since the interrupt is now resolved.
+                Service --> Service : Returns the ChatResponse instance.
+
+              end
+              group Service Except Block (process_hitl_decision)
+                Service -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.CHAT_PROCESSING_FAILED)="BB_CHAT_001",\nmessage="Failed to process approval decision: {str(exc)}", status_code=settings.http_internal_server_error.
+                activate Exceptions
+                Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.CHAT_PROCESSING_FAILED, "BB_CHAT_001").
+                ErrorCodes --> Exceptions : Returns "BB_CHAT_001".
+                Exceptions -> Exceptions : Setting self.error_code, self.message, self.status_code.\nCalling super().__init__(self.message).
+                Exceptions --> Service : AppBaseException raised.
+                deactivate Exceptions
+                Service --> Router : AppBaseException propagates to process_chat then to Router.
+              end
+            end
+
+          else has_pending_interrupt \nreturns False - normal new conversation turn
+
+          Service -> McpClient : Calling run_agent() with request.message and request.thread_id\nin client/agent/mcp_client.py to run the agent in normal synchronous mode.\nThe agent runs to completion or raises a HITL interrupt if add_order is called.
+          activate McpClient
+
+          group MCP Client Block: run_agent(message, thread_id)
+            group MCP Client Try Block (run_agent)
+
+              McpClient -> McpClient : Calling get_client() to create a MultiServerMCPClient\nconfigured with the "bean-brew-tools" server pointing to settings.mcp_server_url.
+              McpClient --> McpClient : Returns the MultiServerMCPClient instance.
+
+              McpClient -> McpClient : Calling client.session("bean-brew-tools") to open an async HTTP connection\nto the MCP server that stays open for all MCP calls in this request.\nThe session closes when the async context manager exits.
+
+              McpClient -> McpClient : Calling load_session_context(session) to load tools, system prompt,\nand all resources unconditionally in one step. — refer to 1.27 to 1.28 sequence number.
+              McpClient --> McpClient : Returns (tools, system_text) ready for agent creation.
+
+              McpClient -> Checkpointer : Calling AsyncPostgresSaver.from_conn_string() with the database URI\nassembled from settings fields using quote_plus to encode the password.\nOpens the async checkpointer that loads and saves conversation state per thread_id.
+              Checkpointer --> McpClient : Returns the AsyncPostgresSaver context manager.
+
+              McpClient -> Checkpointer : Calling await checkpointer.setup()\nto create the checkpoint tables in PostgreSQL if they do not exist yet.\nEnsures memory is ready before the agent runs.
+
+              McpClient -> McpClient : get_summarization_middleware(): creates SummarizationMiddleware with summary LLM. — refer to 1.36 to 1.62 sequence number.
+
+              McpClient -> ClientSettings : Reading settings.max_tokens and settings.temperature\nto get the main agent LLM parameters.
+              ClientSettings -> Env : Reading MAX_TOKENS and TEMPERATURE from .env via os.getenv().
+              Env --> ClientSettings : Returns MAX_TOKENS and TEMPERATURE strings.
+              ClientSettings --> McpClient : Returns max_tokens int and temperature float.
+
+              McpClient -> Helpers : Calling get_llm() with max_tokens and temperature from settings\nto create a ChatBedrock LLM with the normal agent config read from .env.
+              activate Helpers
+              Helpers -> Helpers : get_llm(): checks MODEL_ID, creates boto3 client and ChatBedrock. \nrefer to 1.42 to 1.60 sequence number.
+              Helpers --> McpClient : Returns ChatBedrock llm instance to the caller.
+              deactivate Helpers
+
+              McpClient -> McpClient : Calling create_agent() with llm, tools, system_prompt=SystemMessage(system_text),\nmiddleware=get_pii_middleware() + [get_summarization_middleware(), get_hitl_middleware()], and checkpointer.\nAssembles the ReAct agent with PII protection, summarization, HITL approval, and persistent memory.
+              McpClient --> McpClient : Returns the configured agent runnable.
+
+              McpClient -> McpClient : Calling RunnableConfig() with configurable={"thread_id": thread_id}\nto create the config the checkpointer reads to find the right conversation history.\nUsing the same thread_id across turns continues the same session.
+              McpClient --> McpClient : Returns the RunnableConfig instance.
+
+              McpClient -> McpClient : Calling await agent.ainvoke() with [HumanMessage(content=message)] and config\nto run the full ReAct loop with only the new user message since the checkpointer loads prior history.\nThe loop calls the LLM, calls tools if needed, and repeats until the final response is ready.
+
+              group Tool Invocation during normal mode
+                McpClient -> McpServer : Agent sends the tool call with name and arguments to the MCP server\nover the active streamable_http session to execute check_menu, check_order_status, or add_order.\nThe MCP server runs the tool and returns the result.
+                McpServer --> McpClient : Returns the tool result as a ToolMessage with structured JSON content.
+                note over McpClient,McpServer
+                When the agent needs a tool call, it sends the tool name and arguments to the MCP server.
+                The MCP server runs the tool handler, does any database work, and returns the result as a ToolMessage.
+                The agent may call multiple tools before the LLM produces the final AIMessage.
+                end note
+              end
+
+              McpClient --> McpClient : Returns the full agent result dict from ainvoke().
+
+              McpClient -> McpClient : Calling extract_pending_approval(result) to inspect result["__interrupt__"].\nIf a HumanInTheLoopMiddleware interrupt is present, extracts tool name, args,\nand description from the first interrupt object.
+
+              alt HITL interrupt is present (add_order was intercepted)
+                McpClient --> Service : Returns (None, pending_dict) where pending_dict contains\ntool="add_order", args={customer_name, items}, and description string.
+              else agent ran to completion
+                McpClient -> McpClient : Reading result["messages"][-1].content to get the last message content\nwhich is the final AIMessage the agent produced after all tool calls.\nThis string is the natural language response returned to the service.
+                McpClient --> Service : Returns (response_text, None) — agent completed with no interrupt.
+              end
+            end
+            group MCP Client Except Block (run_agent)
+              McpClient -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.MCP_AGENT_INVOKE_FAILED)="BB_MCP_002",\nmessage="Agent invocation failed: {str(exc)}", status_code=settings.http_internal_server_error.
+              activate Exceptions
+              Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.MCP_AGENT_INVOKE_FAILED, "BB_MCP_002").
+              ErrorCodes --> Exceptions : Returns "BB_MCP_002".
+              Exceptions -> Exceptions : Setting self.error_code="BB_MCP_002", self.message, self.status_code=settings.http_internal_server_error.\nCalling super().__init__(self.message).
+              Exceptions --> McpClient : AppBaseException raised.
+              deactivate Exceptions
+              McpClient --> Service : AppBaseException propagates to process_chat.
+            end
+          end
+          deactivate McpClient
+
+          alt pending is not None (HITL interrupt was raised for add_order)
+            Service -> Service : Building a human-readable message from pending["args"] showing\ncustomer_name and items, asking the customer to reply "approve" or "reject".
+            Service -> Service : Calling ChatResponse() with message and\npending_approval=PendingApproval(tool, args, description)\nso the client knows which tool is waiting and what arguments it would be called with.
+            Service --> Service : Returns ChatResponse with pending_approval populated.
+          else agent ran to completion
+            Service -> Service : Calling ChatResponse(message=message) to wrap the final agent response\nin a ChatResponse Pydantic model.\nstructured_output, stream_chunks, and pending_approval are None for a normal completed turn.
+            Service --> Service : Returns the ChatResponse instance.
+          end
+          end  ' end of detect_hitl_decision alt
+        ' end
+        end  ' end of mode alt (structured / stream / normal)
+      end
+
+      group Service Except Block (process_chat)
+        Service -> Exceptions : Calling AppBaseException.__init__() with\nerror_code=ErrorCodeStatus.get(ErrorCode.CHAT_PROCESSING_FAILED)="BB_CHAT_001",\nmessage="Chat processing failed: {str(exc)}", status_code=settings.http_internal_server_error.
+        activate Exceptions
+        Exceptions -> ErrorCodes : Calling ErrorCodeStatus.get(ErrorCode.CHAT_PROCESSING_FAILED, "BB_CHAT_001").
+        ErrorCodes --> Exceptions : Returns "BB_CHAT_001".
+        Exceptions -> Exceptions : Setting self.error_code="BB_CHAT_001", self.message, self.status_code=settings.http_internal_server_error.\nCalling super().__init__(self.message).
+        Exceptions --> Service : AppBaseException raised.
+        deactivate Exceptions
+        Service --> Router : AppBaseException propagates from service up to the router.
+      end
+    end
+
+    deactivate Service
+
+    group Success Response
+      Router -> Router : Calling response.model_dump(exclude_none=True) to serialise the ChatResponse Pydantic model\nto a dict, omitting any fields that are None, then wrapping it in JSONResponse with status_code=settings.http_ok.\nFastAPI sends this as the HTTP response body.
+      Router -> client : Returning HTTP 200 OK with ChatResponse serialised to JSON.
+      note right of client
+      Normal response (agent completed):
+      {
+        "message": "We have Espresso, Cappuccino, Latte, Cold Brew, Iced Mocha, and Matcha Latte."
+      }
+
+      HITL pending response (add_order intercepted, awaiting human decision):
+      {
+        "message": "Your order is ready to place: [...] for John. Reply 'approve' or 'reject'.",
+        "pending_approval": {
+          "tool": "add_order",
+          "args": {"customer_name": "John", "items": [{"item_name": "Cappuccino", "quantity": 2}]},
+          "description": "Order placement requires your approval"
+        }
+      }
+
+      HITL resume response (after approve/reject):
+      {
+        "message": "Your order has been placed! Order #42 — 2x Cappuccino. Enjoy! ☕"
+      }
+
+      Structured response (mode="structured"):
+      {
+        "message": "Your order for 2x Cappuccino has been placed, John!",
+        "structured_output": {
+          "customer_name": "John",
+          "items": [{"item": "Cappuccino", "quantity": 2, "price": 250.0}]
+        }
+      }
+
+      Streaming response (stream=true):
+      {
+        "message": "Here are our top drinks at Bean and Brew...",
+        "stream_chunks": ["Here ", "are ", "our ", "top ", "drinks", "..."]
+      }
+      end note
+    end
+  end
+
+  group Router Except Block (AppBaseException)
+    Router -> Router : Calling JSONResponse() with e.error_code, e.message, and e.status_code\nto turn the AppBaseException into a structured JSON error response.\nThe HTTP status code comes directly from the exception so the right code is returned.
+    Router -> client : Returning the HTTP error response (4xx or 5xx) with the structured JSON error body.
+    note right
+    {"error_code": "BB_MCP_002", "message": "Agent invocation failed: connection refused"}
+    end note
+  end
+
+  group Router Except Block (Generic Exception)
+    Router -> Router : Calling str(e) on the raw exception and building JSONResponse() with error_code="BB_SYS_001"\nusing settings.http_internal_server_error to convert any unwrapped exception into an error response.\nThis is the last safety net before the error reaches the client.
+    Router -> client : Returning HTTP 500 Internal Server Error with the generic error body.
+    note right
+    {"error_code": "BB_SYS_001", "message": "<raw exception string from str(e)>"}
+    end note
+  end
+end
+
+deactivate Router
+
+deactivate Main
+@enduml
